@@ -18,7 +18,7 @@ VGMSTREAM_REF=master ./build.sh   # 跟随上游最新
 工具链（cmake + emsdk）自动装进 `.work/`，不需要 root、不污染系统。
 产物落在 `dist/`：`vgmstream-cli.js`、`vgmstream-cli.wasm`、`COPYING`。
 
-## 与通用配方的四点差异
+## 与通用配方的五点差异
 
 ### 1. 只保留 Wwise Vorbis，其余解码库全关
 
@@ -32,7 +32,17 @@ VALORANT 的语音 `.wem` 全部是 Wwise Vorbis。判定依据不是推测：�
 **这条是有前提的裁剪。** 若 Riot 之后改用 Wwise Opus 之类的编码，本构建会解不出该文件
 （表现为解码失败而非静默错音）。升级或怀疑时重跑一次抽样即可确认。
 
-### 2. 显式声明 `INCOMING_MODULE_JS_API`
+### 2. 把格式注册表裁到只剩 Wwise
+
+体积上最大的一刀。`src/vgmstream_init.c` 的 `init_vgmstream_functions[]` 静态引用了
+**559 个**格式解析器，链接器因此一个都无法 GC——`meta/`（454 个文件）连同它们各自
+拉起的 `coding/` 解码器全部进了产物。`trim-formats.py` 把这张表裁到只剩
+`init_vgmstream_wwise`，其余代码随即被丢弃：wasm 1863 KB → 1210 KB，brotli 后 615 → 361 KB。
+
+脚本只改注册表数组、不动任何解析器源码，升级 upstream 时不会产生冲突；要多留格式就
+`VGM_KEEP_FORMATS="wwise riff" ./build.sh`。
+
+### 3. 显式声明 `INCOMING_MODULE_JS_API`
 
 新版 emscripten 默认收窄了可从 `Module` 读取的入参。不声明的话，
 `Module.wasmBinary`、`Module.print`、`Module.printErr` 会被**静默忽略**——
@@ -46,12 +56,22 @@ wasm 对象传成 `text/plain` 才换来 br/gzip 压缩的——两者不可兼�
 同时 `-sEXPORTED_RUNTIME_METHODS=FS,callMain` 把这两个方法显式挂到 `Module` 上，
 非模块化脚本原本就会把它们暴露为全局（Worker 里即 `self.FS`），两条路径都可用。
 
-### 3. `MinSizeRel` 而非 `Release`
+### 4. `MinSizeRel` 而非 `Release`，且刻意不用 LTO
 
-实测 wasm 小 12%（brotli 后 615 KB vs 664 KB），解码耗时反而略低
+`MinSizeRel` 实测 wasm 小 12%（brotli 后 615 KB vs 664 KB），解码耗时反而略低
 （同一文件 5 次均值 9.7 ms vs 10.1 ms，差异在噪声内）。没有理由用更大的那个。
 
-### 4. 钉住 vgmstream 版本
+以下三个开关**试过并刻意放弃**：
+
+| 开关 | 收益 | 放弃原因 |
+| --- | --- | --- |
+| `-flto` | wasm 再少一半（1210 → 599 KB） | **产物是坏的。** 连续解码时 `memory access out of bounds`——vgmstream 的 C 代码里有 LTO 会踩中的 UB。单文件测试完全看不出来，是 `batch-compare.mjs` 抓到的。不要加回来。 |
+| `-sMALLOC=emmalloc` | 约 2 KB（br 后） | 回归能过，但收益不值得多一个变量。 |
+| `--closure 1` | 约 4 KB（br 后） | 会重命名全局，使 `self.FS` / `self.callMain` 失效。站内 Worker 依赖这两个全局。 |
+
+前两条合起来省不到总量的 2%，第一条还会静默产出坏构建——这是「再压一点」的收益上限。
+
+### 5. 钉住 vgmstream 版本
 
 `build.sh` 里的 `VGMSTREAM_REF` 默认指向已跑过回归的 upstream 提交，保证任何机器上
 结果可复现。升级时改这个值，然后重跑回归。
@@ -82,7 +102,15 @@ node tools/batch-compare.mjs wem-urls.txt 60 old/vgmstream-cli.js dist/vgmstream
 | --- | --- |
 | 解码成功 | 60/60，两版输出长度完全一致 |
 | 最大单样本偏差 | 1（16-bit 满量程 32768，约 −90 dBFS） |
-| 传输体积（wasm + 胶水，brotli） | 1301 KB → **680 KB** |
+| 传输体积（wasm + 胶水，brotli） | 1301 KB → **377 KB** |
+
+逐步的体积变化：
+
+| 配置 | wasm 裸 | wasm brotli |
+| --- | --- | --- |
+| r1810 全量（线上现役） | 3738 KB | 1280 KB |
+| r2117 + 裁 codec | 1863 KB | 615 KB |
+| + 裁格式注册表 | 1210 KB | **361 KB** |
 
 ±1 LSB 的差异来自 r2117 内部改用 float 解码（元数据新增 `sample type: float`），
 与 r1810 的定点路径舍入不同，不可闻。

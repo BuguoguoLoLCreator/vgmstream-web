@@ -52,7 +52,16 @@ fi
 echo "==> 切到 $VGMSTREAM_REF"
 git -C vgmstream fetch --all --tags --quiet
 git -C vgmstream checkout --quiet "$VGMSTREAM_REF"
+# 每次都从干净源码重新打补丁，避免重复运行时叠加。
+git -C vgmstream reset --hard --quiet
 echo "    $(git -C vgmstream log -1 --format='%h %ad' --date=short)"
+
+# ---------- 裁剪格式注册表 ----------
+# 这是体积上最大的一刀：注册表静态引用全部 559 个格式解析器，链接器因此一个都
+# 无法 GC。裁到只剩 wwise 后，未被引用的 meta/ 与 coding/ 才会被丢弃。
+echo "==> 裁剪格式注册表"
+python3 "$HERE/trim-formats.py" "$WORK/vgmstream/src/vgmstream_init.c" ${VGM_KEEP_FORMATS:-wwise} \
+  | sed 's/^/    /'
 
 # ---------- 配置 ----------
 # codec 裁剪：VALORANT 的 wem 全部是 Wwise Vorbis（fmt 标记 0xFFFF），
@@ -66,6 +75,14 @@ echo "    $(git -C vgmstream log -1 --format='%h %ad' --date=short)"
 # 通常不含该类型，站点靠把对象传成 text/plain 换取压缩，两者不可兼得。
 #
 # MinSizeRel 而非 Release：实测 wasm 小 12%（br 后 615 vs 664 KB）且解码不更慢。
+#
+# 刻意不用的三个开关，都实测过：
+#   -flto            体积再少一半，但产物会在连续解码时 memory access out of bounds。
+#                    vgmstream 的 C 代码里有 LTO 会踩中的 UB。单文件测试发现不了，
+#                    必须跑 tools/batch-compare.mjs 才暴露。**不要加回来。**
+#   -sMALLOC=emmalloc 回归能过，但只省约 2 KB（br 后），不值得多一个变量。
+#   --closure 1      省约 4 KB（br 后），但会重命名全局，使 self.FS / self.callMain
+#                    失效。站内 Worker 依赖这两个全局，收益远小于代价。
 BUILD_DIR="$WORK/build"
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
