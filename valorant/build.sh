@@ -18,28 +18,36 @@ DIST="$HERE/dist"
 # 升级时改这里，并重新跑 tools/batch-compare.mjs 回归。
 VGMSTREAM_REF="${VGMSTREAM_REF:-09c9f40caae4747e44b6a993b3d5b654cef4d1f7}"
 CMAKE_VER="${CMAKE_VER:-3.31.6}"
+EMSDK_VERSION="${EMSDK_VERSION:-6.0.9}"
+RUNTIME_REVISION="${VGM_RUNTIME_REVISION:-r2117-stack-v1}"
 
 mkdir -p "$WORK"
 cd "$WORK"
 
 # ---------- 工具链（免 root，装在 .work 内，不污染系统） ----------
-CMAKE_DIR="$WORK/cmake-$CMAKE_VER-linux-x86_64"
-if [ ! -x "$CMAKE_DIR/bin/cmake" ]; then
+case "$(uname -s):$(uname -m)" in
+  Linux:x86_64) CMAKE_PLATFORM=linux-x86_64; CMAKE_BIN=bin ;;
+  Linux:aarch64|Linux:arm64) CMAKE_PLATFORM=linux-aarch64; CMAKE_BIN=bin ;;
+  Darwin:arm64|Darwin:x86_64) CMAKE_PLATFORM=macos-universal; CMAKE_BIN=CMake.app/Contents/bin ;;
+  *) echo "不支持的构建平台: $(uname -s) $(uname -m)" >&2; exit 1 ;;
+esac
+CMAKE_DIR="$WORK/cmake-$CMAKE_VER-$CMAKE_PLATFORM"
+if [ ! -x "$CMAKE_DIR/$CMAKE_BIN/cmake" ]; then
   echo "==> 下载 cmake $CMAKE_VER"
   curl -sfL --max-time 900 \
-    "https://github.com/Kitware/CMake/releases/download/v$CMAKE_VER/cmake-$CMAKE_VER-linux-x86_64.tar.gz" \
+    "https://github.com/Kitware/CMake/releases/download/v$CMAKE_VER/cmake-$CMAKE_VER-$CMAKE_PLATFORM.tar.gz" \
     -o cmake.tar.gz
   tar -xzf cmake.tar.gz
   rm -f cmake.tar.gz
 fi
-export PATH="$CMAKE_DIR/bin:$PATH"
+export PATH="$CMAKE_DIR/$CMAKE_BIN:$PATH"
 
 if [ ! -d emsdk ]; then
   echo "==> 克隆 emsdk"
   git clone --depth 1 https://github.com/emscripten-core/emsdk.git emsdk
 fi
-echo "==> 安装并激活 emsdk latest"
-(cd emsdk && ./emsdk install latest >/dev/null && ./emsdk activate latest >/dev/null)
+echo "==> 安装并激活 emsdk $EMSDK_VERSION"
+(cd emsdk && ./emsdk install "$EMSDK_VERSION" >/dev/null && ./emsdk activate "$EMSDK_VERSION" >/dev/null)
 # shellcheck disable=SC1091
 source emsdk/emsdk_env.sh >/dev/null 2>&1
 echo "    emcc: $(emcc --version | head -1)"
@@ -54,6 +62,7 @@ git -C vgmstream fetch --all --tags --quiet
 git -C vgmstream checkout --quiet "$VGMSTREAM_REF"
 # 每次都从干净源码重新打补丁，避免重复运行时叠加。
 git -C vgmstream reset --hard --quiet
+VGMSTREAM_COMMIT="$(git -C vgmstream rev-parse HEAD)"
 echo "    $(git -C vgmstream log -1 --format='%h %ad' --date=short)"
 
 # ---------- 裁剪格式注册表 ----------
@@ -73,13 +82,15 @@ python3 "$HERE/trim-formats.py" "$WORK/vgmstream/src/vgmstream_init.c" ${VGM_KEE
 # wasmBinary 尤其关键：调用方预置字节后胶水就不会走 instantiateStreaming，
 # 而 streaming 强校验 Content-Type 必须是 application/wasm——CDN 的压缩白名单
 # 通常不含该类型，站点靠把对象传成 text/plain 换取压缩，两者不可兼得。
+# callMain 会在 WASM 栈上分配 argv 而不恢复。导出栈接口，并由 post-js 对两种
+# callMain 入口统一包 finally；只增大 STACK_SIZE 会延迟故障，不能修复长期连续调用。
 #
 # MinSizeRel 而非 Release：实测 wasm 小 12%（br 后 615 vs 664 KB）且解码不更慢。
 #
 # 刻意不用的三个开关，都实测过：
 #   -flto            体积再少一半，但产物会在连续解码时 memory access out of bounds。
-#                    vgmstream 的 C 代码里有 LTO 会踩中的 UB。单文件测试发现不了，
-#                    必须跑 tools/batch-compare.mjs 才暴露。**不要加回来。**
+#                    旧回归未排除 argv 栈累积，不能据此确认 C 代码 UB；本次继续关闭，
+#                    重新启用时须单独跑长期解码与音频一致性回归。
 #   -sMALLOC=emmalloc 回归能过，但只省约 2 KB（br 后），不值得多一个变量。
 #   --closure 1      省约 4 KB（br 后），但会重命名全局，使 self.FS / self.callMain
 #                    失效。站内 Worker 依赖这两个全局，收益远小于代价。
@@ -101,21 +112,26 @@ emcmake cmake "$WORK/vgmstream" \
   -DBUILD_CLI=ON \
   -DBUILD_V123=OFF \
   -DBUILD_AUDACIOUS=OFF \
-  -DCMAKE_EXE_LINKER_FLAGS="-sINCOMING_MODULE_JS_API=wasmBinary,noInitialRun,print,printErr,onRuntimeInitialized,onAbort,locateFile -sEXPORTED_RUNTIME_METHODS=FS,callMain" \
+  -DCMAKE_EXE_LINKER_FLAGS="-sINCOMING_MODULE_JS_API=wasmBinary,noInitialRun,print,printErr,onRuntimeInitialized,onAbort,locateFile -sEXPORTED_RUNTIME_METHODS=FS,callMain,stackSave,stackRestore --post-js \"$HERE/restore-stack.js\"" \
   >/dev/null
 
 echo "==> 编译"
-make -j"$(nproc)" 2>&1 | tail -3
+cmake --build . --parallel "${VGM_BUILD_JOBS:-8}" 2>&1 | tail -3
 
 # ---------- 产物 ----------
 mkdir -p "$DIST"
 cp cli/vgmstream-cli.js cli/vgmstream-cli.wasm "$DIST/"
 cp "$WORK/vgmstream/COPYING" "$DIST/COPYING"
 
+# 构建成功不等于运行时契约正确：直接重复调用产物入口，防止漏带 post-js 或栈导出。
+"$EMSDK_NODE" "$HERE/tools/verify-runtime.mjs" "$DIST/vgmstream-cli.js"
+"$EMSDK_NODE" "$HERE/tools/write-manifest.mjs" "$DIST" \
+  "$VGMSTREAM_COMMIT" "$EMSDK_VERSION" "$CMAKE_VER" "$RUNTIME_REVISION"
+
 echo
-echo "==> 产物（$DIST）"
+echo "==> 产物（${DIST}）"
 for f in vgmstream-cli.js vgmstream-cli.wasm COPYING; do
-  printf '    %-20s %8d bytes\n' "$f" "$(stat -c%s "$DIST/$f")"
+  printf '    %-20s %8d bytes\n' "$f" "$(wc -c < "$DIST/$f")"
 done
 echo
 echo "下一步：node tools/batch-compare.mjs <urls.txt> 60 <旧胶水.js> dist/vgmstream-cli.js"
