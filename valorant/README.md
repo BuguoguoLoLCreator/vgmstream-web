@@ -128,13 +128,20 @@ node --test tests/*.test.mjs
 
 ## 发布与回滚
 
-把 `dist/` 的四个公开文件整批上传到独立目录 `vgmstream/r2117-stack-v1/`，按 `build-info.json` 核验哈希。
-目录需匿名 CORS；WASM 保持 `Content-Type: text/plain` 以适配现有 CDN 压缩策略，JS 使用 JavaScript 类型。
-带修订号的目录可用 `Cache-Control: public, max-age=31536000, immutable`，发布后不得原地覆盖。
+固定发布到 `https://ks3-cdn.buguoguo.cn/static/website/vgmstream/`，覆盖原文件名，不创建修订子目录。
+`r2117-stack-v1` 仅表示构建清单中的修订号；本站 Worker 对 JS/WASM 统一追加 `?v=r2117-stack-v1` 隔离浏览器旧缓存，版本参数不能替代 CDN 缓存刷新。
 
-**先上传并核验运行时，再把本站构建环境的 `PUBLIC_VOICE_WASM_BASE` 切到新目录并重新发布前端。**
-只改本站代码默认值不会覆盖显式配置的旧环境变量。保留旧目录；回滚时切回旧地址并重建前端，
-本站遇到缺少栈接口的旧运行时会退回每段解码后回收 Worker 的兼容方式。
+先备份线上旧产物，再整批覆盖 `dist/` 的四个公开文件。全部上传后刷新 CDN 缓存（含带版本参数的变体），
+下载实际 URL 的解压后内容并按 `build-info.json` 核验哈希，确认同批后再发布本站前端。
+目录需匿名 CORS；WASM 保持 `Content-Type: text/plain`，JS 使用 JavaScript 类型，并核验 br/gzip 压缩。
+同路径对象后续还会覆盖，保持 `Cache-Control: public, max-age=86400, stale-while-revalidate=604800`，不使用 immutable。
+
+本站 `PUBLIC_VOICE_WASM_BASE` 保持原目录。
+发布后重新加载页面以使用新 Worker；清 CDN 缓存不会清除浏览器缓存或更新已运行的 Worker，旧页面仍可能碰到新旧产物混用。
+后续运行时升级必须同步更换 Worker 的缓存修订号并发布前端，即使 CDN 对象路径不变。
+
+回滚必须成对恢复旧 JS/WASM 及其清单，刷新 CDN 缓存并恢复对应前端版本；如果沿用新前端回滚运行时，
+需为回滚使用新的缓存修订号并重建前端。本站遇到缺少栈接口的旧运行时会退回每段解码后回收 Worker 的兼容方式。
 
 部署包只应包含这四个公开文件，不包含 `.work/`、源码、样本、环境文件或日志。
 
